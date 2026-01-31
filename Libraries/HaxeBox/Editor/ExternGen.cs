@@ -5,121 +5,94 @@ using System.Linq;
 using System.Reflection;
 using System.Runtime.CompilerServices;
 using System.Text;
-using System.Xml.Linq;
-using Editor;
-using Sandbox;
 
 class ExternGen
 {
     private static Dictionary<string, int> GENERIC_ARITY = new(StringComparer.Ordinal);
+    private static Dictionary<string, List<int>> GENERIC_DEFS = new(StringComparer.Ordinal);
 
     public static string GenerateFromRuntime(string outRoot)
     {
+        if (string.IsNullOrWhiteSpace(outRoot))
+            throw new ArgumentException(nameof(outRoot));
+
         if (!Directory.Exists(outRoot))
             Directory.CreateDirectory(outRoot);
 
         _ = typeof(Sandbox.GameObject);
 
         EnsureSandboxAssembliesLoaded();
-        var types = CollectSandboxTypes();
+        var runtimeTypes = CollectSandboxTypes();
 
-        // ---- docs (best-effort) ----
-        var doc = new DocProvider(types.Select(t => t.Assembly).Distinct());
+        // 1) build generic definitions index once
+        GENERIC_DEFS = BuildGenericDefsIndex(runtimeTypes);
 
-        // ---- generic arity map ----
+        // 2) runtime -> ApiType (schema-like)
+        var apiTypes = runtimeTypes
+            .Select(BuildApiType)
+            .Where(t => !string.IsNullOrWhiteSpace(t.FullName))
+            .ToList();
+
         GENERIC_ARITY = new Dictionary<string, int>(StringComparer.Ordinal);
-        foreach (var t in types)
+        foreach (var t in apiTypes)
         {
-            var fn = t.FullName ?? t.Name;
-            if (string.IsNullOrWhiteSpace(fn)) continue;
-
-            // 1) from `N
-            if (TryGetArityFromTick(fn, out var tickN))
-            {
-                var noTick = StripTick(fn);
-                // keep both keys: with and without `N (TypeToCsName() uses with `N)
-                GENERIC_ARITY[fn] = tickN;
-                GENERIC_ARITY[noTick] = tickN;
-            }
-
-            // 2) from <...> (rare for reflection FullName, but keep)
+            var fn = Str(t.FullName);
             var sp = SplitGenericType(fn);
             if (sp.Args.Count > 0)
-            {
                 GENERIC_ARITY[sp.Base] = sp.Args.Count;
-                GENERIC_ARITY[StripTick(sp.Base)] = sp.Args.Count;
-            }
-
-            // 3) from real definition
-            if (t.IsGenericTypeDefinition)
-            {
-                var n = t.GetGenericArguments().Length;
-                GENERIC_ARITY[fn] = n;
-                GENERIC_ARITY[StripTick(fn)] = n;
-            }
         }
 
         int typeCount = 0;
         int memberCount = 0;
 
-        foreach (var t in types.OrderBy(x => x.FullName, StringComparer.Ordinal))
+        // generation loop (same as your Haxe)
+        foreach (var t in apiTypes)
         {
-            var full = t.FullName ?? t.Name;
-            if (string.IsNullOrWhiteSpace(full)) continue;
+            var full = Str(t.FullName);
 
             if (full.Contains("$", StringComparison.Ordinal) ||
                 full.Contains(".<", StringComparison.Ordinal) ||
                 full.Contains("+<", StringComparison.Ordinal) ||
                 full.Contains("\\u003C", StringComparison.Ordinal) ||
                 full.Contains("\\u003E", StringComparison.Ordinal))
-            {
                 continue;
-            }
 
-            if (IsCompilerGeneratedType(t))
-                continue;
+            if (full == "") full = Str(t.Name);
+            if (full == "") continue;
 
             var pkgInfo = MapPackageForOutRootSbox(full);
             var hxPackage = pkgInfo.Pkg;
             var relDir = pkgInfo.RelDir;
 
-            var hxTypeName = HxTypeNameFromCs(full);
-            var typeOutDir = string.IsNullOrEmpty(relDir) ? outRoot : Join(outRoot, relDir);
+            var hxTypeName = SanitizeTypeName(SimpleName(full));
+            var typeOutDir = (relDir == "") ? outRoot : Join(outRoot, relDir);
             EnsureDir(typeOutDir);
 
-            var tgen = TypeGenericParams(t);
+            var tgen = TypeGenericParams(full);
             var tgenPart = tgen.Count > 0 ? "<" + string.Join(",", tgen) + ">" : "";
 
             var sb = new StringBuilder();
             sb.Append("package ").Append(hxPackage).Append(";\n\n");
-            sb.Append("// EXTERNGEN_MARK: v2026-01-31\n");
-            sb.Append("// EXTERNGEN_DLL: ").Append(Assembly.GetExecutingAssembly().Location.Replace("\\", "/")).Append("\n\n");
-
-            var tDoc = doc.GetTypeSummary(t);
-            if (!string.IsNullOrWhiteSpace(tDoc))
-                sb.Append("/** ").Append(EscDoc(tDoc)).Append(" */\n");
-
             sb.Append("@:native(\"").Append(Esc(full)).Append("\")\n");
             sb.Append("extern class ").Append(hxTypeName).Append(tgenPart).Append(" {\n");
 
-            // ---- ctors ----
-            var ctors = t.GetConstructors(BindingFlags.Public | BindingFlags.Instance);
-            if (ctors.Length > 0)
+            // ctors
+            if (t.Constructors != null)
             {
-                var uniq = new Dictionary<string, ParameterInfo[]>(StringComparer.Ordinal);
-
-                foreach (var c in ctors)
+                var uniq = new Dictionary<string, List<ApiParam>>(StringComparer.Ordinal);
+                foreach (var c in t.Constructors)
                 {
-                    var ps = c.GetParameters();
-                    var key = "new(" + string.Join(",", ps.Select(p => NormTypeForKey(MapType(TypeToCsName(p.ParameterType))))) + ")";
+                    if (!c.IsPublic) continue;
+                    var ps = c.Parameters ?? new List<ApiParam>();
+
+                    var key = "new(" + string.Join(",", ps.Select(p => NormTypeForKey(MapType(p.Type)))) + ")";
                     if (!uniq.ContainsKey(key))
                         uniq[key] = ps;
                 }
 
-                var list = uniq
-                    .Select(kv => (Key: kv.Key, Ps: kv.Value))
-                    .OrderBy(x => x.Key, StringComparer.Ordinal)
-                    .ToList();
+                var list = uniq.Select(kv => (Key: kv.Key, Ps: kv.Value))
+                               .OrderBy(x => x.Key, StringComparer.Ordinal)
+                               .ToList();
 
                 bool allOver = list.Count > 1;
                 foreach (var it in list)
@@ -132,77 +105,65 @@ class ExternGen
                 }
             }
 
-            // ---- props ----
-            var props = t.GetProperties(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.Static);
-            foreach (var p in props)
+            // props
+            if (t.Properties != null)
             {
-                var get = p.GetGetMethod(true);
-                var set = p.GetSetMethod(true);
+                foreach (var p in t.Properties)
+                {
+                    if (!p.IsPublic) continue;
+                    var name = Str(p.Name);
+                    if (name == "") continue;
 
-                bool hasGet = get != null;
-                bool hasSet = set != null;
+                    var pt = Str(p.PropertyType);
+                    if (pt == "") pt = "System.Object";
 
-                bool visible =
-                    (get != null && (get.IsPublic || get.IsFamily || get.IsFamilyOrAssembly)) ||
-                    (set != null && (set.IsPublic || set.IsFamily || set.IsFamilyOrAssembly));
+                    bool hasGet = p.HasGet ?? true;
+                    bool hasSet = p.HasSet ?? true;
 
-                if (!visible) continue;
+                    var acc = (!hasGet && !hasSet) ? "default"
+                            : (hasGet && hasSet) ? "get,set"
+                            : (hasGet) ? "get,never"
+                            : "never,set";
 
-                var name = p.Name;
-                if (string.IsNullOrWhiteSpace(name)) continue;
-                if (IsBadMemberName(name)) continue;
+                    var summary = p.Documentation?.Summary ?? "";
+                    if (!string.IsNullOrWhiteSpace(summary))
+                        sb.Append("  /** ").Append(EscDoc(summary)).Append(" */\n");
 
-                var acc = (!hasGet && !hasSet) ? "default"
-                        : (hasGet && hasSet) ? "get,set"
-                        : (hasGet) ? "get,never"
-                        : "never,set";
-
-                var pDoc = doc.GetPropertySummary(p);
-                if (!string.IsNullOrWhiteSpace(pDoc))
-                    sb.Append("  /** ").Append(EscDoc(pDoc)).Append(" */\n");
-
-                sb.Append("  var ").Append(SanitizeMemberName(name))
-                  .Append("(").Append(acc).Append("):")
-                  .Append(MapType(TypeToCsName(p.PropertyType))).Append(";\n");
-                memberCount++;
+                    sb.Append("  var ").Append(SanitizeMemberName(name))
+                      .Append("(").Append(acc).Append("):")
+                      .Append(MapType(pt)).Append(";\n");
+                    memberCount++;
+                }
             }
 
-            // ---- methods ----
-            var methods = new List<RuntimeMethod>();
-            var ms = t.GetMethods(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.Static);
-            foreach (var m in ms)
+            // methods (same grouping/dedup logic)
+            var methods = new List<ApiMethod>();
+            if (t.Methods != null)
             {
-                if (m.IsSpecialName) continue;
-
-                bool isPublic = m.IsPublic;
-                bool isProtected = m.IsFamily || m.IsFamilyOrAssembly;
-                if (!isPublic && !isProtected) continue;
-
-                if (m.DeclaringType != t) continue;
-
-                var name = m.Name;
-                if (string.IsNullOrWhiteSpace(name)) continue;
-                if (IsBadMemberName(name)) continue;
-
-                methods.Add(new RuntimeMethod
+                foreach (var m in t.Methods)
                 {
-                    Info = m,
-                    Name = name,
-                    ReturnType = TypeToCsName(m.ReturnType),
-                    IsStatic = m.IsStatic,
-                    IsProtected = isProtected,
-                    Parameters = m.GetParameters()
-                });
+                    var isPublic = m.IsPublic;
+                    var isProtected = m.IsProtected;
+                    if (!isPublic && !isProtected) continue;
+
+                    var name = Str(m.Name);
+                    if (name == "") continue;
+
+                    var ret = Str(m.ReturnType);
+                    if (ret == "") ret = "System.Void";
+
+                    methods.Add(m);
+                }
             }
 
             if (methods.Count > 0)
             {
-                var byName = new Dictionary<string, List<RuntimeMethod>>(StringComparer.Ordinal);
+                var byName = new Dictionary<string, List<ApiMethod>>(StringComparer.Ordinal);
                 foreach (var m in methods)
                 {
                     if (!byName.TryGetValue(m.Name, out var arr))
                     {
-                        arr = new List<RuntimeMethod>();
+                        arr = new List<ApiMethod>();
                         byName[m.Name] = arr;
                     }
                     arr.Add(m);
@@ -214,7 +175,7 @@ class ExternGen
                 {
                     var grp = byName[mn];
 
-                    var unique = new Dictionary<string, RuntimeMethod>(StringComparer.Ordinal);
+                    var unique = new Dictionary<string, ApiMethod>(StringComparer.Ordinal);
                     foreach (var mm in grp)
                     {
                         var gen = CollectGenericParams(mm);
@@ -230,8 +191,8 @@ class ExternGen
 
                     uniqArr.Sort((a, b) =>
                     {
-                        int pa = a.Parameters.Length;
-                        int pb = b.Parameters.Length;
+                        int pa = a.Parameters.Count;
+                        int pb = b.Parameters.Count;
                         if (pa != pb) return pa.CompareTo(pb);
 
                         var ga = CollectGenericParams(a);
@@ -239,14 +200,13 @@ class ExternGen
                         return string.Compare(SignatureKey(a, ga), SignatureKey(b, gb), StringComparison.Ordinal);
                     });
 
+                    var summaryText = FirstSummary(uniqArr);
+                    if (summaryText != "")
+                        sb.Append("  /** ").Append(EscDoc(summaryText)).Append(" */\n");
+
                     foreach (var mm in uniqArr)
                     {
                         var gen = CollectGenericParams(mm);
-
-                        var mDoc = doc.GetMethodSummary(mm.Info);
-                        if (!string.IsNullOrWhiteSpace(mDoc))
-                            sb.Append("  /** ").Append(EscDoc(mDoc)).Append(" */\n");
-
                         WriteMethodLine(sb, mm, gen, allOverloads);
                         memberCount++;
                     }
@@ -254,163 +214,212 @@ class ExternGen
             }
 
             sb.Append("}\n");
-
             File.WriteAllText(Path.Combine(typeOutDir, hxTypeName + ".hx"), sb.ToString(), Encoding.UTF8);
             typeCount++;
         }
 
-        return $"Externs generated:\n{outRoot}\n\nTypes: {typeCount}\nMembers: {memberCount}";
+        return $"Done. Types: {typeCount}, Members: {memberCount}\n{outRoot}";
     }
 
-    // ----------------- FIX #2: @:protected inline -----------------
-    private static void WriteMethodLine(StringBuilder sb, RuntimeMethod m, List<string> gen, bool asOverload)
+    // ==========================================================
+    // Runtime -> ApiType (the ONLY place we "change logic")
+    // ==========================================================
+    private static ApiType BuildApiType(Type t)
     {
-        var st = m.IsStatic ? "static " : "";
-        var ov = asOverload ? "overload " : "";
-        var genPart = gen.Count > 0 ? "<" + string.Join(",", gen) + ">" : "";
+        // schema-like FullName string (keeps `N for generic defs; keeps <...> for constructed)
+        var fullName = TypeToSchemaName(t).Replace("+", ".", StringComparison.Ordinal);
 
-        sb.Append("  ");
-        if (m.IsProtected) sb.Append("@:protected ");
-        sb.Append(st).Append(ov)
-          .Append("function ").Append(SanitizeMemberName(m.Name)).Append(genPart)
-          .Append("(").Append(FmtPars(m.Parameters))
-          .Append("):").Append(MapType(m.ReturnType)).Append(";\n");
-    }
-
-    private sealed class RuntimeMethod
-    {
-        public MethodInfo Info = null!;
-        public string Name = "";
-        public string ReturnType = "";
-        public bool IsStatic;
-        public bool IsProtected;
-        public ParameterInfo[] Parameters = Array.Empty<ParameterInfo>();
-    }
-
-    // ----------------- FIX #1: generic arity robust -----------------
-    private static string MapType(string cs)
-    {
-        cs = (cs ?? "").Trim();
-
-        switch (cs)
+        var at = new ApiType
         {
-            case "":
-                return "Dynamic";
-            case "Dynamic":
-            case "Void":
-            case "Int":
-            case "UInt":
-            case "Float":
-            case "Bool":
-            case "String":
-                return cs;
-        }
+            FullName = fullName,
+            Name = t.Name ?? "",
+            Constructors = new List<ApiConstructor>(),
+            Properties = new List<ApiProperty>(),
+            Methods = new List<ApiMethod>()
+        };
 
-        var sp = SplitGenericType(cs);
-        var @base = sp.Base;
-        var args = sp.Args;
-
-        // If no <...> but base is generic definition or we know its arity -> fill Dynamic params
-        if (args.Count == 0)
+        // ctors (public only)
+        foreach (var c in t.GetConstructors(BindingFlags.Public | BindingFlags.Instance))
         {
-            var normBase = StripTickPreserveNested(@base);
-
-            if (TryGetArityFromTick(@base, out var n) ||
-                GENERIC_ARITY.TryGetValue(@base, out n) ||
-                GENERIC_ARITY.TryGetValue(normBase, out n))
+            at.Constructors.Add(new ApiConstructor
             {
-                args = new List<string>();
-                for (int i = 0; i < n; i++)
-                    args.Add("Dynamic");
+                IsPublic = true,
+                Parameters = c.GetParameters().Select(p => new ApiParam
+                {
+                    Name = string.IsNullOrWhiteSpace(p.Name) ? "arg" : p.Name!,
+                    Type = TypeToSchemaName(p.ParameterType).Replace("+", ".", StringComparison.Ordinal)
+                }).ToList()
+            });
+        }
+
+        // props (public accessors)
+        var props = t.GetProperties(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.Static);
+        foreach (var p in props)
+        {
+            var get = p.GetGetMethod(true);
+            var set = p.GetSetMethod(true);
+            bool anyPublic = (get != null && get.IsPublic) || (set != null && set.IsPublic);
+            if (!anyPublic) continue;
+
+            at.Properties.Add(new ApiProperty
+            {
+                IsPublic = true,
+                Name = p.Name ?? "",
+                PropertyType = TypeToSchemaName(p.PropertyType).Replace("+", ".", StringComparison.Ordinal),
+                HasGet = get != null,
+                HasSet = set != null,
+                Documentation = null
+            });
+        }
+
+        // methods
+        var ms = t.GetMethods(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.Static);
+        foreach (var m in ms)
+        {
+            if (m.IsSpecialName) continue;
+            if (m.DeclaringType != t) continue;
+
+            bool isPublic = m.IsPublic;
+            bool isProtected = m.IsFamily || m.IsFamilyOrAssembly;
+            if (!isPublic && !isProtected) continue;
+
+            // method generic parameter names (T, TKey, ...)
+            var mg = m.IsGenericMethodDefinition
+                ? m.GetGenericArguments().Select(a => a.Name).ToList()
+                : new List<string>();
+
+            // return type + params in "schema-like strings"
+            var ret = TypeToSchemaName(m.ReturnType).Replace("+", ".", StringComparison.Ordinal);
+            ret = UpgradeNonGenericToKnownGeneric(ret, mg);
+
+            var pars = m.GetParameters().Select(p =>
+            {
+                var pt = TypeToSchemaName(p.ParameterType).Replace("+", ".", StringComparison.Ordinal);
+                pt = UpgradeNonGenericToKnownGeneric(pt, mg);
+
+                return new ApiParam
+                {
+                    Name = string.IsNullOrWhiteSpace(p.Name) ? "arg" : p.Name!,
+                    Type = pt
+                };
+            }).ToList();
+
+            at.Methods.Add(new ApiMethod
+            {
+                Name = m.Name ?? "",
+                ReturnType = ret,
+                IsStatic = m.IsStatic,
+                IsPublic = isPublic,
+                IsProtected = isProtected,
+                Parameters = pars,
+                Documentation = null
+            });
+        }
+
+        return at;
+    }
+
+    // Generic "upgrade" rule:
+    // If a type string is non-generic BUT there exists a generic definition with same base name,
+    // rewrite it to Base`N<methodGenericArgs...> (or Dynamic) so collectGenericParams/mapType behave like schema.
+    private static string UpgradeNonGenericToKnownGeneric(string typeStr, List<string> methodGen)
+    {
+        typeStr = (typeStr ?? "").Trim();
+        if (typeStr == "") return typeStr;
+
+        // array: upgrade element
+        if (typeStr.EndsWith("[]", StringComparison.Ordinal))
+        {
+            var inner = typeStr.Substring(0, typeStr.Length - 2);
+            inner = UpgradeNonGenericToKnownGeneric(inner, methodGen);
+            return inner + "[]";
+        }
+
+        // already has <...> or `N -> leave
+        if (typeStr.IndexOf('<') >= 0 || typeStr.IndexOf('`') >= 0)
+            return typeStr;
+
+        // base name key: full name without generic args/backticks (here none), already normalized '.' not '+'
+        if (!GENERIC_DEFS.TryGetValue(typeStr, out var arities) || arities.Count == 0)
+            return typeStr;
+
+        int methodN = methodGen.Count;
+
+        // choose arity: prefer exact match to method generic count, else smallest
+        int n = arities.Contains(methodN) && methodN > 0 ? methodN : arities.Min();
+
+        var args = new List<string>(n);
+        for (int i = 0; i < n; i++)
+        {
+            if (i < methodGen.Count) args.Add(methodGen[i]);
+            else args.Add("Dynamic");
+        }
+
+        return typeStr + "`" + n + "<" + string.Join(",", args) + ">";
+    }
+
+    private static Dictionary<string, List<int>> BuildGenericDefsIndex(List<Type> types)
+    {
+        var map = new Dictionary<string, List<int>>(StringComparer.Ordinal);
+
+        foreach (var t in types)
+        {
+            if (!t.IsGenericTypeDefinition) continue;
+
+            var fn = (t.FullName ?? "").Replace("+", ".", StringComparison.Ordinal);
+            if (fn == "") continue;
+
+            int tick = fn.IndexOf('`');
+            if (tick < 0) continue;
+
+            var baseName = fn.Substring(0, tick);
+            int n = t.GetGenericArguments().Length;
+            if (n <= 0) continue;
+
+            if (!map.TryGetValue(baseName, out var arr))
+            {
+                arr = new List<int>();
+                map[baseName] = arr;
             }
+            if (!arr.Contains(n)) arr.Add(n);
         }
 
-        if (IsGenericParamName(@base))
-            return @base;
-
-        var sr = SimpleName(@base);
-        if (IsGenericParamName(sr))
-            return sr;
-
-        if (@base.EndsWith("[]", StringComparison.Ordinal))
-        {
-            var inner = @base.Substring(0, @base.Length - 2);
-            return "Array<" + MapType(inner) + ">";
-        }
-
-        if (cs.StartsWith("System.Nullable`1<", StringComparison.Ordinal) && cs.EndsWith(">", StringComparison.Ordinal))
-        {
-            var inner = (args.Count > 0) ? args[0] : "System.Object";
-            return "Null<" + MapType(inner) + ">";
-        }
-
-        switch (StripTickPreserveNested(@base))
-        {
-            case "System.Void": return "Void";
-            case "System.Boolean": return "Bool";
-            case "System.String": return "String";
-            case "System.Single":
-            case "System.Double":
-            case "System.Decimal":
-                return "Float";
-            case "System.Int16":
-            case "System.UInt16":
-            case "System.Int32":
-            case "System.Byte":
-            case "System.SByte":
-                return "Int";
-            case "System.UInt32":
-                return "UInt";
-            case "System.Int64":
-                return "haxe.Int64";
-            case "System.Object":
-                return "Dynamic";
-        }
-
-        var mappedBase = MapNonSystem(@base);
-
-        if (args.Count > 0)
-        {
-            if (mappedBase == "Dynamic") return "Dynamic";
-            var mappedArgs = string.Join(",", args.Select(MapType));
-            return mappedBase + "<" + mappedArgs + ">";
-        }
-
-        return mappedBase;
+        return map;
     }
 
-    private static bool TryGetArityFromTick(string s, out int n)
+    // ==========================================================
+    // Type string builder (schema-like)
+    // ==========================================================
+    private static string TypeToSchemaName(Type t)
     {
-        n = 0;
-        if (string.IsNullOrWhiteSpace(s)) return false;
+        if (t == null) return "System.Object";
 
-        int tick = s.IndexOf('`');
-        if (tick < 0 || tick + 1 >= s.Length) return false;
+        if (t.IsArray)
+            return TypeToSchemaName(t.GetElementType()!) + "[]";
 
-        int i = tick + 1;
-        int val = 0;
-        bool any = false;
-        while (i < s.Length)
+        if (t.IsGenericParameter)
+            return t.Name;
+
+        if (t.IsGenericType && t.GetGenericTypeDefinition().FullName == "System.Nullable`1")
         {
-            char c = s[i];
-            if (c < '0' || c > '9') break;
-            any = true;
-            val = (val * 10) + (c - '0');
-            i++;
+            var inner = t.GetGenericArguments()[0];
+            return "System.Nullable`1<" + TypeToSchemaName(inner) + ">";
         }
 
-        if (!any || val <= 0) return false;
-        n = val;
-        return true;
+        if (t.IsGenericType)
+        {
+            var def = t.GetGenericTypeDefinition();
+            var defName = def.FullName ?? def.Name; // includes `N
+            var args = t.GetGenericArguments().Select(TypeToSchemaName);
+            return defName + "<" + string.Join(",", args) + ">";
+        }
+
+        return t.FullName ?? t.Name ?? "System.Object";
     }
 
-    private static string StripTick(string s)
-    {
-        s = (s ?? "").Trim();
-        int tick = s.IndexOf('`');
-        return tick >= 0 ? s.Substring(0, tick) : s;
-    }
-
+    // ==========================================================
+    // Haxe-generator logic (ported 1:1)
+    // ==========================================================
     private static string NormTypeForKey(string t)
     {
         t = (t ?? "").Trim();
@@ -419,27 +428,46 @@ class ExternGen
         return t;
     }
 
-    private static string SignatureKey(RuntimeMethod m, List<string> gen)
+    private static void WriteMethodLine(StringBuilder sb, ApiMethod m, List<string> gen, bool asOverload)
+    {
+        if (m.IsProtected)
+            sb.Append("  @:protected\n");
+
+        var st = m.IsStatic ? "static " : "";
+        var ov = asOverload ? "overload " : "";
+        var genPart = gen.Count > 0 ? "<" + string.Join(",", gen) + ">" : "";
+
+        sb.Append("  ").Append(st).Append(ov)
+          .Append("function ").Append(SanitizeMemberName(m.Name)).Append(genPart)
+          .Append("(").Append(FmtPars(m.Parameters))
+          .Append("):").Append(MapType(m.ReturnType)).Append(";\n");
+    }
+
+    private static string SignatureKey(ApiMethod m, List<string> gen)
     {
         var ret = MapType(m.ReturnType);
-        var pars = string.Join(",", m.Parameters.Select(p => NormTypeForKey(MapType(TypeToCsName(p.ParameterType)))));
+        var pars = string.Join(",", m.Parameters.Select(p => NormTypeForKey(MapType(p.Type))));
         var gp = string.Join(",", gen);
         return (m.IsStatic ? "S" : "I") + (m.IsProtected ? "P" : "U") + "|" + m.Name + "|<" + gp + ">|" + ret + "|(" + pars + ")";
     }
 
-    private static List<string> CollectGenericParams(RuntimeMethod m)
+    private static string FirstSummary(List<ApiMethod> arr)
+    {
+        foreach (var m in arr)
+        {
+            var s = m.Documentation?.Summary ?? "";
+            if (!string.IsNullOrWhiteSpace(s))
+                return s.Trim();
+        }
+        return "";
+    }
+
+    private static List<string> CollectGenericParams(ApiMethod m)
     {
         var set = new HashSet<string>(StringComparer.Ordinal);
-
-        // method generic parameters (best-effort)
-        if (m.Info.IsGenericMethodDefinition)
-            foreach (var ga in m.Info.GetGenericArguments())
-                if (IsGenericParamName(ga.Name)) set.Add(ga.Name);
-
         AddGenericParamsFromType(set, m.ReturnType);
         foreach (var p in m.Parameters)
-            AddGenericParamsFromType(set, TypeToCsName(p.ParameterType));
-
+            AddGenericParamsFromType(set, p.Type);
         var outList = set.ToList();
         outList.Sort(StringComparer.Ordinal);
         return outList;
@@ -452,10 +480,14 @@ class ExternGen
                 set.Add(tok);
     }
 
-    private static List<string> TypeGenericParams(Type t)
+    private static List<string> TypeGenericParams(string nativeType)
     {
-        if (!t.IsGenericTypeDefinition) return new List<string>();
-        return t.GetGenericArguments().Select(x => x.Name).ToList();
+        int lt = nativeType.IndexOf("<", StringComparison.Ordinal);
+        int gt = nativeType.LastIndexOf(">", StringComparison.Ordinal);
+        if (lt < 0 || gt <= lt) return new List<string>();
+        var inner = nativeType.Substring(lt + 1, gt - lt - 1).Trim();
+        if (inner == "") return new List<string>();
+        return inner.Split(',').Select(x => x.Trim()).Where(x => x != "").ToList();
     }
 
     private static List<string> ExtractTypeTokens(string s)
@@ -572,9 +604,94 @@ class ExternGen
         return outList;
     }
 
+    private static string MapType(string cs)
+    {
+        cs = (cs ?? "").Trim();
+
+        switch (cs)
+        {
+            case "":
+                return "Dynamic";
+            case "Dynamic":
+            case "Void":
+            case "Int":
+            case "UInt":
+            case "Float":
+            case "Bool":
+            case "String":
+                return cs;
+        }
+
+        var sp = SplitGenericType(cs);
+        var @base = sp.Base;
+        var args = sp.Args;
+
+        if (args.Count == 0 && GENERIC_ARITY.TryGetValue(@base, out var n))
+        {
+            args = new List<string>();
+            for (int i = 0; i < n; i++)
+                args.Add("Dynamic");
+        }
+
+        if (IsGenericParamName(@base))
+            return @base;
+
+        var sr = SimpleName(@base);
+        if (IsGenericParamName(sr))
+            return sr;
+
+        if (@base.EndsWith("[]", StringComparison.Ordinal))
+        {
+            var inner = @base.Substring(0, @base.Length - 2);
+            return "Array<" + MapType(inner) + ">";
+        }
+
+        if (cs.StartsWith("System.Nullable`1<", StringComparison.Ordinal) && cs.EndsWith(">", StringComparison.Ordinal))
+        {
+            var inner = (args.Count > 0) ? args[0] : "System.Object";
+            return "Null<" + MapType(inner) + ">";
+        }
+
+        switch (@base)
+        {
+            case "System.Void": return "Void";
+            case "System.Boolean": return "Bool";
+            case "System.String": return "String";
+            case "System.Single":
+            case "System.Double":
+            case "System.Decimal":
+                return "Float";
+            case "System.Int16":
+            case "System.UInt16":
+            case "System.Int32":
+            case "System.Byte":
+            case "System.SByte":
+                return "Int";
+            case "System.UInt32":
+                return "UInt";
+            case "System.Int64":
+                return "haxe.Int64";
+            case "System.Object":
+                return "Dynamic";
+        }
+
+        var mappedBase = MapNonSystem(@base);
+
+        if (args.Count > 0)
+        {
+            mappedBase = MapNonSystem(@base);
+            if (mappedBase == "Dynamic") return "Dynamic";
+
+            var mappedArgs = string.Join(",", args.Select(MapType));
+            return mappedBase + "<" + mappedArgs + ">";
+        }
+
+        return mappedBase;
+    }
+
     private static string MapNonSystem(string cs)
     {
-        var simple = HxTypeNameFromCs(cs);
+        var simple = SanitizeTypeName(SimpleName(cs));
 
         if (!cs.Contains(".", StringComparison.Ordinal))
             return "sbox." + simple;
@@ -594,17 +711,17 @@ class ExternGen
         return "Dynamic";
     }
 
-    private static string FmtPars(ParameterInfo[] pars)
+    private static string FmtPars(List<ApiParam> pars)
     {
-        if (pars.Length == 0) return "";
+        if (pars.Count == 0) return "";
 
         var used = new HashSet<string>(StringComparer.Ordinal);
         var outList = new List<string>();
 
-        for (int i = 0; i < pars.Length; i++)
+        for (int i = 0; i < pars.Count; i++)
         {
             var raw = pars[i].Name;
-            var n = SanitizeMemberName(string.IsNullOrWhiteSpace(raw) ? ("arg" + i) : raw!.Trim());
+            var n = SanitizeMemberName(string.IsNullOrWhiteSpace(raw) ? ("arg" + i) : raw.Trim());
 
             var baseName = n;
             int k = 2;
@@ -615,7 +732,7 @@ class ExternGen
             }
 
             used.Add(n);
-            outList.Add(n + ":" + MapType(TypeToCsName(pars[i].ParameterType)));
+            outList.Add(n + ":" + MapType(pars[i].Type));
         }
 
         return string.Join(", ", outList);
@@ -675,8 +792,8 @@ class ExternGen
 
     private static string EscDoc(string s)
     {
-        s = (s ?? "").Replace("\r", " ").Replace("\n", " ").Trim();
-        while (s.Contains("  ", StringComparison.Ordinal)) s = s.Replace("  ", " ");
+        s = (s ?? "");
+        s = s.Replace("\r", " ").Replace("\n", " ");
         return s.Replace("*/", "* /");
     }
 
@@ -696,90 +813,31 @@ class ExternGen
 
     private static string Norm(string p) => (p ?? "").Replace("\\", "/");
 
-    private static void EnsureDir(string p)
-    {
-        // safer than manual splitting (works for absolute paths too)
-        Directory.CreateDirectory(p);
-    }
+    private static void EnsureDir(string p) => Directory.CreateDirectory(p);
 
-    private static string TypeToCsName(Type t)
-    {
-        if (t == null) return "System.Object";
+    private static string Str(string v) => v ?? "";
 
-        if (t.IsArray)
-            return TypeToCsName(t.GetElementType()!) + "[]";
-
-        if (t.IsGenericParameter)
-            return t.Name;
-
-        if (t.IsGenericType && t.GetGenericTypeDefinition().FullName == "System.Nullable`1")
-        {
-            var inner = t.GetGenericArguments()[0];
-            return "System.Nullable`1<" + TypeToCsName(inner) + ">";
-        }
-
-        if (t.IsGenericType)
-        {
-            var def = t.GetGenericTypeDefinition();
-            var defName = def.FullName ?? def.Name;
-            var args = t.GetGenericArguments().Select(TypeToCsName);
-            return defName + "<" + string.Join(",", args) + ">";
-        }
-
-        return t.FullName ?? t.Name;
-    }
-
-    private static bool IsCompilerGeneratedType(Type t)
-    {
-        if (t.IsDefined(typeof(CompilerGeneratedAttribute), inherit: false))
-            return true;
-
-        var name = t.Name ?? "";
-        if (name.StartsWith("<", StringComparison.Ordinal))
-            return true;
-
-        if (name.Contains("DisplayClass", StringComparison.Ordinal) ||
-            name.Contains("AnonStorey", StringComparison.Ordinal))
-            return true;
-
-        return false;
-    }
-
-    private static bool IsBadMemberName(string name)
-    {
-        if (string.IsNullOrWhiteSpace(name)) return true;
-
-        if (name[0] == '<') return true;
-        if (name.Contains("<", StringComparison.Ordinal) || name.Contains(">", StringComparison.Ordinal))
-            return true;
-        return false;
-    }
-
-    private readonly struct PkgInfo
-    {
-        public readonly string Pkg;
-        public readonly string RelDir;
-        public PkgInfo(string pkg, string relDir) { Pkg = pkg; RelDir = relDir; }
-    }
-
-    private static PkgInfo MapPackageForOutRootSbox(string nativeFull)
+    private static (string Pkg, string RelDir) MapPackageForOutRootSbox(string nativeFull)
     {
         string ns = "";
         int dot = nativeFull.LastIndexOf(".", StringComparison.Ordinal);
         if (dot >= 0) ns = nativeFull.Substring(0, dot);
 
         if (ns == "Sandbox")
-            return new PkgInfo("sbox", "");
+            return ("sbox", "");
 
         if (ns.StartsWith("Sandbox.", StringComparison.Ordinal))
         {
             var rest = ns.Substring("Sandbox.".Length).ToLowerInvariant();
-            return new PkgInfo("sbox." + rest, rest.Replace('.', '/'));
+            return ("sbox." + rest, rest.Replace('.', '/'));
         }
 
-        return new PkgInfo("sbox", "");
+        return ("sbox", "");
     }
 
+    // ==========================================================
+    // Sandbox runtime collection
+    // ==========================================================
     private static void EnsureSandboxAssembliesLoaded()
     {
         var candidates = new[]
@@ -802,7 +860,8 @@ class ExternGen
         foreach (var a in AppDomain.CurrentDomain.GetAssemblies().ToArray())
         {
             AssemblyName[] refs;
-            try { refs = a.GetReferencedAssemblies(); } catch { continue; }
+            try { refs = a.GetReferencedAssemblies(); }
+            catch { continue; }
 
             foreach (var r in refs)
             {
@@ -864,159 +923,69 @@ class ExternGen
             .ToList();
     }
 
-    // ----------------- XML docs (best-effort) -----------------
-    private sealed class DocProvider
+    private static bool IsCompilerGeneratedType(Type t)
     {
-        private readonly Dictionary<string, string> _map = new(StringComparer.Ordinal);
+        if (t.IsDefined(typeof(CompilerGeneratedAttribute), inherit: false))
+            return true;
 
-        public DocProvider(IEnumerable<Assembly> assemblies)
-        {
-            foreach (var asm in assemblies)
-            {
-                var loc = "";
-                try { loc = asm.Location ?? ""; } catch { }
-                if (string.IsNullOrWhiteSpace(loc)) continue;
+        var name = t.Name ?? "";
+        if (name.StartsWith("<", StringComparison.Ordinal))
+            return true;
 
-                var xml = Path.ChangeExtension(loc, ".xml");
-                if (!File.Exists(xml)) continue;
+        if (name.Contains("DisplayClass", StringComparison.Ordinal) ||
+            name.Contains("AnonStorey", StringComparison.Ordinal))
+            return true;
 
-                try
-                {
-                    var x = XDocument.Load(xml);
-                    var members = x.Root?.Element("members")?.Elements("member");
-                    if (members == null) continue;
-
-                    foreach (var m in members)
-                    {
-                        var name = (string?)m.Attribute("name");
-                        if (string.IsNullOrWhiteSpace(name)) continue;
-
-                        var sum = m.Element("summary")?.Value;
-                        if (string.IsNullOrWhiteSpace(sum)) continue;
-
-                        sum = Clean(sum);
-                        if (sum == "") continue;
-
-                        _map[name!] = sum;
-                    }
-                }
-                catch { }
-            }
-        }
-
-        public string GetTypeSummary(Type t)
-        {
-            var full = t.FullName ?? "";
-            if (full == "") return "";
-            var key = "T:" + full;
-            return _map.TryGetValue(key, out var s) ? s : "";
-        }
-
-        public string GetPropertySummary(PropertyInfo p)
-        {
-            var dt = p.DeclaringType?.FullName ?? "";
-            if (dt == "") return "";
-            var key = "P:" + dt + "." + p.Name;
-            return _map.TryGetValue(key, out var s) ? s : "";
-        }
-
-        public string GetMethodSummary(MethodInfo m)
-        {
-            var dt = m.DeclaringType?.FullName ?? "";
-            if (dt == "") return "";
-
-            // try exact-ish without params first (works surprisingly often as a prefix in docs)
-            // M:Namespace.Type.Method
-            var prefix = "M:" + dt + "." + m.Name;
-
-            // 1) exact match
-            if (_map.TryGetValue(prefix, out var s0))
-                return s0;
-
-            // 2) prefix match (ignore overload params)
-            foreach (var kv in _map)
-                if (kv.Key.StartsWith(prefix, StringComparison.Ordinal))
-                    return kv.Value;
-
-            return "";
-        }
-
-        private static string Clean(string s)
-        {
-            s = (s ?? "").Replace("\r", " ").Replace("\n", " ").Trim();
-            while (s.Contains("  ", StringComparison.Ordinal)) s = s.Replace("  ", " ");
-            return s;
-        }
+        return false;
     }
 
-    private static string HxTypeNameFromCs(string csFullOrBase)
+    // ==========================================================
+    // Api-like models (minimal)
+    // ==========================================================
+    private sealed class ApiType
     {
-        csFullOrBase = (csFullOrBase ?? "").Trim();
-        if (csFullOrBase == "") return "Type";
-
-        // remove generic args <...> if any
-        int lt = csFullOrBase.IndexOf("<", StringComparison.Ordinal);
-        if (lt >= 0) csFullOrBase = csFullOrBase.Substring(0, lt);
-
-        // strip namespace
-        int dot = csFullOrBase.LastIndexOf(".", StringComparison.Ordinal);
-        string typePart = dot >= 0 ? csFullOrBase.Substring(dot + 1) : csFullOrBase;
-
-        // flatten nested types: Outer`1+Inner`2 => Outer_Inner
-        var parts = typePart.Split('+', StringSplitOptions.RemoveEmptyEntries);
-
-        var cleanedParts = new List<string>(parts.Length);
-        foreach (var p in parts)
-        {
-            var seg = p.Trim();
-
-            // remove `N for each segment only (do NOT drop "+Inner")
-            int tick = seg.IndexOf('`');
-            if (tick >= 0) seg = seg.Substring(0, tick);
-
-            // keep only [A-Za-z0-9_]
-            var sb = new StringBuilder();
-            for (int i = 0; i < seg.Length; i++)
-            {
-                char c = seg[i];
-                bool isAZ = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z');
-                bool is09 = (c >= '0' && c <= '9');
-                if (isAZ || is09 || c == '_') sb.Append(c);
-            }
-
-            var outSeg = sb.ToString();
-            if (outSeg == "") outSeg = "Type";
-            cleanedParts.Add(outSeg);
-        }
-
-        var name = string.Join("_", cleanedParts);
-        if (name.Length > 0 && char.IsDigit(name[0])) name = "_" + name;
-        return name == "" ? "Type" : name;
+        public string FullName = "";
+        public string Name = "";
+        public List<ApiConstructor>? Constructors;
+        public List<ApiProperty>? Properties;
+        public List<ApiMethod>? Methods;
     }
 
-    private static string StripTickPreserveNested(string s)
+    private sealed class ApiConstructor
     {
-        s = (s ?? "").Trim();
-        if (s == "") return s;
+        public bool IsPublic;
+        public List<ApiParam>? Parameters;
+    }
 
-        // remove <...>
-        int lt = s.IndexOf("<", StringComparison.Ordinal);
-        if (lt >= 0) s = s.Substring(0, lt);
+    private sealed class ApiProperty
+    {
+        public bool IsPublic;
+        public string Name = "";
+        public string PropertyType = "";
+        public bool? HasGet;
+        public bool? HasSet;
+        public ApiDoc? Documentation;
+    }
 
-        // strip `N inside each nested segment
-        int dot = s.LastIndexOf(".", StringComparison.Ordinal);
-        string ns = dot >= 0 ? s.Substring(0, dot + 1) : "";
-        string typePart = dot >= 0 ? s.Substring(dot + 1) : s;
+    private sealed class ApiMethod
+    {
+        public string Name = "";
+        public string ReturnType = "";
+        public bool IsStatic;
+        public bool IsProtected;
+        public bool IsPublic;
+        public List<ApiParam> Parameters = new();
+        public ApiDoc? Documentation;
+    }
 
-        var parts = typePart.Split('+', StringSplitOptions.RemoveEmptyEntries);
-        for (int i = 0; i < parts.Length; i++)
-        {
-            var seg = parts[i];
-            int tick = seg.IndexOf('`');
-            if (tick >= 0) seg = seg.Substring(0, tick);
-            parts[i] = seg;
-        }
+    private sealed class ApiParam
+    {
+        public string Name = "";
+        public string Type = "";
+    }
 
-        return ns + string.Join("+", parts);
+    private sealed class ApiDoc
+    {
+        public string Summary = "";
     }
 }
